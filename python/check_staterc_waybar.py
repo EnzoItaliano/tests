@@ -10,7 +10,8 @@ rename.
 This covers: a fresh install, duplicate keys, Python and bash writers
 running at the same time losing nothing, a failed replace leaving staterc
 intact, ensure_state_file() not deadlocking on the lock it reaches through
-get_current_layout_from_config(), and the file's mode being kept.
+get_current_layout_from_config(), the file's mode being kept, and values
+being quoted and escaped the way staterc.sh writes them (HyDE-Project/HyDE#2197).
 """
 
 from __future__ import annotations
@@ -86,14 +87,14 @@ def leftovers() -> list[str]:
 # 1. fresh install: no hyde/ directory yet
 reset(None)
 wb.set_state_value("A", "1")
-if not wb.STATE_FILE.exists() or wb.STATE_FILE.read_text() != "A=1\n":
+if not wb.STATE_FILE.exists() or wb.STATE_FILE.read_text() != 'A="1"\n':
     fail(f"fresh install: {wb.STATE_FILE.read_text() if wb.STATE_FILE.exists() else 'no file'!r}")
 
 # 2. a key present twice ends up once, other keys kept
 reset('A=1\nB="2"\nA=3\n')
 wb.set_state_value("A", "2")
 lines = wb.STATE_FILE.read_text().splitlines()
-if lines.count("A=2") != 1 or any(l.startswith("A=") and l != "A=2" for l in lines) or 'B="2"' not in lines:
+if lines.count('A="2"') != 1 or any(l.startswith("A=") and l != 'A="2"' for l in lines) or 'B="2"' not in lines:
     fail(f"duplicate key: {lines}")
 
 # 3. Python and bash writers at the same time lose nothing
@@ -107,7 +108,7 @@ for p in procs:
     p.wait(timeout=60)
 text = wb.STATE_FILE.read_text().splitlines()
 missing = ([f"S{i}" for i in range(8) if f'S{i}="s{i}"' not in text]
-           + [f"P{i}" for i in range(20) if f"P{i}=v{i}" not in text]
+           + [f"P{i}" for i in range(20) if f'P{i}="v{i}"' not in text]
            + [f"B{i}" for i in range(20) if f'B{i}="v{i}"' not in text])
 if missing:
     fail(f"concurrent writers lost {len(missing)} key(s): {missing}")
@@ -146,7 +147,7 @@ if runner.is_alive():
     fail("ensure_state_file() is still running after 2s (deadlocked on the staterc lock?)")
 else:
     got = wb.STATE_FILE.read_text().splitlines() if wb.STATE_FILE.exists() else []
-    for want in ("WAYBAR_LAYOUT_PATH=/x/a.jsonc", "WAYBAR_LAYOUT_NAME=a", "WAYBAR_STYLE_PATH=/x/a.css"):
+    for want in ('WAYBAR_LAYOUT_PATH="/x/a.jsonc"', 'WAYBAR_LAYOUT_NAME="a"', 'WAYBAR_STYLE_PATH="/x/a.css"'):
         if got.count(want) != 1:
             fail(f"ensure_state_file() on a missing file: {want} not there exactly once in {got}")
 
@@ -167,7 +168,7 @@ try:
     wb.set_state_value("A", "2")
 except OSError as exc:
     fail(f"set_state_value() raised when staterc.lock could not be opened: {exc!r}")
-if wb.STATE_FILE.read_text() != "A=2\n":
+if wb.STATE_FILE.read_text() != 'A="2"\n':
     fail(f"value not written when staterc.lock could not be opened: {wb.STATE_FILE.read_text()!r}")
 lock_path.rmdir()
 
@@ -181,7 +182,8 @@ with mock.patch.object(wb, "get_current_layout_from_config",
     except AssertionError as exc:
         fail(f"ensure_state_file() looked up the layout although staterc has it: {exc}")
 got = wb.STATE_FILE.read_text().splitlines()
-for want in ("WAYBAR_LAYOUT_PATH=/x/a.jsonc", "WAYBAR_LAYOUT_NAME=a", "WAYBAR_STYLE_PATH=/x/a.css"):
+# The seeded line, written by an older waybar.py, is kept as it was.
+for want in ("WAYBAR_LAYOUT_PATH=/x/a.jsonc", 'WAYBAR_LAYOUT_NAME="a"', 'WAYBAR_STYLE_PATH="/x/a.css"'):
     if got.count(want) != 1:
         fail(f"only the path present: {want} not there exactly once in {got}")
 
@@ -203,9 +205,49 @@ with mock.patch.object(wb, "get_current_layout_from_config", side_effect=stale_l
      mock.patch.object(wb, "resolve_style_path", return_value="/x/a.css"):
     wb.ensure_state_file()
 got = wb.STATE_FILE.read_text().splitlines()
-for want in ('HYPR_SHADER="disable"', "WAYBAR_LAYOUT_PATH=/y/b.jsonc", "WAYBAR_LAYOUT_NAME=b",
-             "WAYBAR_STYLE_PATH=/y/b.css"):
+for want in ('HYPR_SHADER="disable"', 'WAYBAR_LAYOUT_PATH="/y/b.jsonc"', 'WAYBAR_LAYOUT_NAME="b"',
+             'WAYBAR_STYLE_PATH="/y/b.css"'):
     if got.count(want) != 1:
         fail(f"concurrent layout overwritten by ensure_state_file(): {want} not once in {got}")
+
+# 10. values are quoted and escaped like staterc.sh's, and read back unchanged
+# (HyDE-Project/HyDE#2197); a line from an older waybar.py, unquoted, still reads
+for value in ('a"b', "$(id)", "a\\b", "a b c", "`id`", "a\\", ""):
+    reset(None)
+    wb.set_state_value("K", value)
+    got = wb.get_state_value("K")
+    if got != value:
+        fail(f"round-trip of {value!r}: got {got!r} from {wb.STATE_FILE.read_text()!r}")
+reset("WAYBAR_LAYOUT_PATH=/x/a b.jsonc\n")
+if wb.get_state_value("WAYBAR_LAYOUT_PATH") != "/x/a b.jsonc":
+    fail(f"old unquoted line: got {wb.get_state_value('WAYBAR_LAYOUT_PATH')!r}")
+reset('A="1"\n')
+try:
+    wb.set_state_value("K", "a\nb")
+    fail("set_state_value() accepted a value with a newline")
+except ValueError:
+    pass
+if wb.STATE_FILE.read_text() != 'A="1"\n':
+    fail(f"a refused value changed staterc: {wb.STATE_FILE.read_text()!r}")
+reset(None)
+wb._add_missing_state_values({"K": 'x"$y'})
+if wb.get_state_value("K") != 'x"$y':
+    fail(f"_add_missing_state_values() did not escape: {wb.STATE_FILE.read_text()!r}")
+
+# 11. every writer and reader agree: what waybar.py writes, `source` reads back
+# without running anything; what staterc.sh writes, waybar.py reads back
+reset(None)
+pwned = work / "PWNED"
+value = f'$(touch {pwned}) "q" `touch {pwned}` \\'
+wb.set_state_value("P", value)
+sourced = subprocess.run(["bash", "-c", '. "$1"; printf %s "$P"', "_", str(wb.STATE_FILE)],
+                         capture_output=True, text=True)
+if sourced.stdout != value:
+    fail(f"source read back {sourced.stdout!r} ({sourced.stderr.strip()!r}), expected {value!r}")
+if pwned.exists():
+    fail("sourcing what waybar.py wrote ran a command")
+subprocess.run(["bash", str(HELPER), "set", "B", 'x"y\\$z'], check=True)
+if wb.get_state_value("B") != 'x"y\\$z':
+    fail(f"waybar.py read {wb.get_state_value('B')!r} back from staterc.sh")
 
 sys.exit(1 if failures else 0)
