@@ -6,7 +6,8 @@
 # $XDG_STATE_HOME/hyde/staterc. Unlocked and truncated in place, two of them
 # at once wiped it down to one line (HyDE-Project/HyDE#2194). staterc.sh is
 # the locked, atomic writer that set_conf() and Lua share: one KEY="value"
-# line per key, every other line kept, values stored literally.
+# line per key, every other line kept, values escaped so `source` reads them
+# back unchanged (HyDE-Project/HyDE#2197).
 ##
 
 . "$(dirname -- "$0")/lib/common.sh"
@@ -144,7 +145,8 @@ env -i \
     PATH="/usr/bin:/bin" \
     bash -c ". '$global_control' >/dev/null 2>&1 || exit 97; set_conf A 'back\\slash'"
 expect 0 "$?" "set_conf exit status"
-expect 'A="back\slash"' "$(grep '^A=' "$staterc")" "set_conf with a backslash in the value"
+expect 'A="back\\slash"' "$(grep '^A=' "$staterc")" "set_conf with a backslash in the value"
+expect 'back\slash' "$(bash -c '. "$1"; printf %s "$A"' _ "$staterc")" "set_conf backslash read back by source"
 
 # 10. waybar.py takes the same lock: Python and bash writers together
 if command -v python3 >/dev/null 2>&1; then
@@ -153,6 +155,28 @@ if command -v python3 >/dev/null 2>&1; then
 else
     skip "python3 is not installed"
 fi
+
+# 13. values with quotes, $, backticks and backslashes are escaped, so
+# sourcing staterc gives them back and runs nothing (HyDE-Project/HyDE#2197)
+# shellcheck disable=SC1003,SC2016 # literal values, on purpose
+for value in 'a"b' '$(touch "$work_dir/PWNED")' '`touch "$work_dir/PWNED2"`' \
+    'a\b' '\' 'a\' '"' '$HOME' 'x\$y' ''; do
+    reset_state
+    set_state K "$value"
+    got=$(work_dir="$work_dir" bash -c '. "$1"; printf %s "$K"' _ "$staterc" 2>&1)
+    expect "$value" "$got" "escaped value read back by source"
+done
+[ -e "$work_dir/PWNED" ] && fail "sourcing staterc ran a \$(...) in a value"
+[ -e "$work_dir/PWNED2" ] && fail "sourcing staterc ran a backtick command in a value"
+reset_state
+set_state K "Gruvbox Retro"
+expect 'K="Gruvbox Retro"' "$(cat "$staterc")" "ordinary value written as before"
+reset_state $'A="1"\n'
+set_state K $'a\nb' 2>/dev/null
+expect 2 "$?" "value with a newline exit status"
+set_state K $'a\rb' 2>/dev/null
+expect 2 "$?" "value with a carriage return exit status"
+expect 'A="1"' "$(cat "$staterc")" "file after a refused value"
 
 # 11. Lua's staterc_set() goes through the helper. luautils needs lfs
 # (LuaFileSystem): HyDE's own lua_env, or a system package as on CI.
