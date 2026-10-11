@@ -12,7 +12,8 @@ This covers: under systemd, restart_waybar() restarts the unit (after
 reset-failed) and only falls back to run_waybar() when the restart fails; the
 non-systemd path keeps its SIGUSR2 reload; _atomic_write() replaces a file in
 one step, keeps its mode, writes through a symlink and leaves nothing behind
-on failure; and one --set refreshes the files and restarts Waybar once.
+on failure; one --set refreshes the files and restarts Waybar once; and so
+does --update with a theme preset, creating user-style.css too.
 subprocess.run is mocked throughout, so no real unit is touched.
 """
 
@@ -214,5 +215,32 @@ with mock.patch.object(wb, "list_layouts", return_value=listing), \
 for name, n in counts.items():
     if n != 1:
         fail(f"--set ran {name}() {n} time(s), expected once")
+
+# 7. --update with a theme preset (the color hook, on every wallpaper change)
+# also refreshes and restarts once. apply_theme_layout() already did both, so
+# main() must neither repeat the refresh after the restart nor restart again;
+# and the user-style.css that style.css imports must still be created.
+wb._layout_applied = False
+counts = {name: 0 for name in counts}
+user_style = work / "config/waybar/user-style.css"
+with mock.patch.object(wb, "list_layouts", return_value=listing), \
+     mock.patch.object(wb, "get_value_from_hypr_theme", return_value="alpha"), \
+     mock.patch.object(wb, "get_current_layout_from_config", return_value=str(layout)), \
+     mock.patch.object(wb, "restart_waybar", side_effect=counter("restart_waybar")), \
+     mock.patch.object(wb, "generate_includes", side_effect=counter("generate_includes")), \
+     mock.patch.object(wb, "update_global_css", side_effect=counter("update_global_css")), \
+     mock.patch.object(wb, "update_icon_size"), \
+     mock.patch.object(wb, "update_border_radius"), \
+     mock.patch.object(wb.notify, "send"), \
+     mock.patch.object(sys, "argv", ["waybar.py", "--update"]):
+    try:
+        wb.main()
+    except SystemExit:
+        pass
+for name, n in counts.items():
+    if n != 1:
+        fail(f"--update with a theme preset ran {name}() {n} time(s), expected once")
+if not user_style.exists():
+    fail("--update with a theme preset did not create user-style.css, which style.css imports")
 
 sys.exit(1 if failures else 0)
